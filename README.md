@@ -76,6 +76,7 @@ Message your Telegram bot. If you're a new user, a pairing request will appear i
 | `API_SERVER_ENABLED` | `false` | Set `true` to expose the OpenAI-compatible API at `/v1` (see below) |
 | `API_SERVER_KEY` | *(unset)* | **Required** when the API is enabled — Bearer token clients must send. Use a strong random value (`openssl rand -hex 32`) |
 | `API_SERVER_MODEL_NAME` | `hermes-agent` | Model id reported by `/v1/models` and accepted by `/v1/chat/completions` |
+| `HERMES_EXTRA_CONFIG` | *(unset)* | YAML appended to the generated `config.yaml` on every gateway start (e.g. an `mcp_servers` section). `config.yaml` is regenerated on each start, so put persistent extra config here |
 
 All other configuration (LLM provider, model, channels, tools) is managed through the admin dashboard.
 

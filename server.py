@@ -183,8 +183,13 @@ def read_env(path: Path) -> dict[str, str]:
 
 
 def write_config_yaml(data: dict[str, str]) -> None:
-    """Write a minimal config.yaml so hermes picks up the model and provider."""
+    """Write a minimal config.yaml so hermes picks up the model and provider.
+
+    The file is rewritten on every gateway start, so extra top-level sections
+    (e.g. mcp_servers) are appended from the HERMES_EXTRA_CONFIG env var.
+    """
     model = data.get("LLM_MODEL", "")
+    extra = os.environ.get("HERMES_EXTRA_CONFIG", "").strip()
     config_path = Path(HERMES_HOME) / "config.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(f"""\
@@ -201,7 +206,7 @@ agent:
   max_iterations: 50
 
 data_dir: "{HERMES_HOME}"
-""")
+""" + (f"\n{extra}\n" if extra else ""))
 
 
 def write_env(path: Path, data: dict[str, str]) -> None:

@@ -4,7 +4,8 @@ Hermes Agent — Railway admin server.
 Responsibilities:
   - Admin UI / setup wizard at /setup (Starlette + Jinja, cookie-auth guarded)
   - Management API at /setup/api/* (config, status, logs, gateway, pairing)
-  - Reverse proxy at / and /* → native Hermes dashboard (hermes_cli/web_server, on 127.0.0.1:9119)
+  - Reverse proxy at / and /* → native Hermes dashboard (hermes_cli/web_server, on 127.0.0.1:9119),
+    including its /api/* WebSockets (chat, events feed, PTY)
   - Managed subprocesses: `hermes gateway` (agent) and `hermes dashboard` (native UI)
   - Cookie-based session auth at /login (HMAC-signed, 7-day expiry, httponly)
 
@@ -29,12 +30,12 @@ import secrets
 import signal
 import time
 from collections import deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import httpx
 from starlette.applications import Starlette
-from starlette.requests import Request
+from starlette.requests import HTTPConnection, Request
 from starlette.responses import (
     HTMLResponse,
     JSONResponse,
@@ -42,8 +43,11 @@ from starlette.responses import (
     Response,
     StreamingResponse,
 )
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
 from starlette.templating import Jinja2Templates
+from starlette.websockets import WebSocket, WebSocketDisconnect
+from websockets.asyncio.client import connect as ws_connect
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -322,7 +326,7 @@ def _verify_auth_token(token: str) -> bool:
         return False
 
 
-def _is_authenticated(request: Request) -> bool:
+def _is_authenticated(request: HTTPConnection) -> bool:
     return _verify_auth_token(request.cookies.get(COOKIE_NAME, ""))
 
 
@@ -1044,7 +1048,7 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     """Forward an authenticated request to the Hermes dashboard subprocess.
 
     Assumes edge auth (basic auth middleware) has already validated the caller.
-    HTTP-only: the native Hermes dashboard does not use WebSockets.
+    HTTP only; WebSocket upgrades go through route_ws_proxy.
     """
     client = get_http_client()
     target = f"{HERMES_DASHBOARD_URL}{request.url.path}"
@@ -1213,6 +1217,85 @@ async def route_proxy(request: Request) -> Response:
     return await _proxy_to_dashboard(request)
 
 
+# Close codes a peer may not send itself (RFC 6455 §7.4.1).
+_RESERVED_CLOSE_CODES = {1005, 1006, 1015}
+
+
+async def route_ws_proxy(websocket: WebSocket) -> None:
+    """Relay the dashboard's /api/* WebSockets (chat, events feed, PTY).
+
+    Same cookie gate as the HTTP proxy, plus an Origin check so another site
+    can't open a socket on the user's cookie. The browser's Host and Origin are
+    not forwarded: hermes only accepts upgrades addressed to its loopback bind.
+    The query string is, because it carries hermes's own ?token= credential.
+    """
+    origin = websocket.headers.get("origin", "")
+    host = websocket.headers.get("host", "")
+    authed = _is_authenticated(websocket)
+    if not authed or (origin and _urlparse(origin).netloc != host):
+        print(
+            f"[ws-proxy] rejected {websocket.url.path}: authed={authed} "
+            f"origin={origin!r} host={host!r}",
+            flush=True,
+        )
+        await websocket.close(code=4401)
+        return
+
+    target = f"ws://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}{websocket.url.path}"
+    if websocket.url.query:
+        target = f"{target}?{websocket.url.query}"
+    cookie = websocket.headers.get("cookie")
+
+    try:
+        upstream = await ws_connect(
+            target,
+            additional_headers={"cookie": cookie} if cookie else None,
+            subprotocols=websocket.scope.get("subprotocols") or None,
+            max_size=None,
+            ping_interval=None,  # the browser and hermes keep their own heartbeats
+            open_timeout=10,
+        )
+    except (OSError, TimeoutError, InvalidStatus) as e:
+        print(f"[ws-proxy] upstream connect failed for {websocket.url.path}: {e}", flush=True)
+        await websocket.close(code=1011)
+        return
+
+    await websocket.accept(subprotocol=upstream.subprotocol)
+
+    async def browser_to_hermes():
+        with suppress(WebSocketDisconnect, ConnectionClosed):
+            while True:
+                msg = await websocket.receive()
+                if msg["type"] == "websocket.disconnect":
+                    return
+                if msg.get("bytes") is not None:
+                    await upstream.send(msg["bytes"])
+                elif msg.get("text") is not None:
+                    await upstream.send(msg["text"])
+
+    async def hermes_to_browser():
+        with suppress(WebSocketDisconnect, ConnectionClosed):
+            async for msg in upstream:
+                if isinstance(msg, bytes):
+                    await websocket.send_bytes(msg)
+                else:
+                    await websocket.send_text(msg)
+
+    pumps = [asyncio.create_task(browser_to_hermes()), asyncio.create_task(hermes_to_browser())]
+    try:
+        await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in pumps:
+            task.cancel()
+        await upstream.close()
+        # Pass hermes's close code on (e.g. 4401/4403) so the SPA reacts to it.
+        code = upstream.close_code
+        if code is None or code in _RESERVED_CLOSE_CODES:
+            code = 1011 if code == 1006 else 1000
+        with suppress(RuntimeError, WebSocketDisconnect):  # browser already gone
+            await websocket.close(code=code)
+
+
 async def route_setup_404(request: Request) -> Response:
     """Typos under /setup/* should 404 here — not fall through to the proxy."""
     if err := guard(request): return err
@@ -1292,6 +1375,7 @@ routes = [
 
     # Catch-all: everything else proxies to the Hermes dashboard subprocess.
     Route("/{path:path}",                       route_proxy,         methods=ANY_METHOD),
+    WebSocketRoute("/api/{path:path}",          route_ws_proxy),
 ]
 
 # No middleware — auth is enforced per-handler via guard(). This keeps /health
